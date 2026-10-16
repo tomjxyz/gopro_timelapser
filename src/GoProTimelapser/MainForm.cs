@@ -52,13 +52,13 @@ public sealed class MainForm : Form
     private bool _syncingSpeed;
     private bool _outputEdited;
 
-    public MainForm()
+    public MainForm(string[]? initialPaths = null)
     {
         Text = "GoPro Timelapser";
         Font = new Font("Segoe UI", 9F);
         AutoScaleMode = AutoScaleMode.Dpi;
-        ClientSize = new Size(820, 720);
-        MinimumSize = new Size(640, 560);
+        ClientSize = new Size(860, 800);
+        MinimumSize = new Size(700, 720);
         StartPosition = FormStartPosition.CenterScreen;
         try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
 
@@ -94,6 +94,10 @@ public sealed class MainForm : Form
         UpdateQualityLabel();
         UpdateClipSummary();
         UpdateButtons();
+
+        // Files dropped onto the exe icon in Explorer arrive as command-line arguments.
+        if (initialPaths is { Length: > 0 })
+            Shown += (_, _) => AddPaths(initialPaths);
 
         FormClosing += (_, e) =>
         {
@@ -185,8 +189,8 @@ public sealed class MainForm : Form
 
     private Control BuildSpeedGroup()
     {
-        var group = new GroupBox { Text = "Speed", Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(8) };
-        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 3 };
+        var group = new GroupBox { Text = "Speed", Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(8) };
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 3 };
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
@@ -218,13 +222,14 @@ public sealed class MainForm : Form
         layout.Controls.Add(_speedBox, 1, 0);
         layout.Controls.Add(new Label { Text = "× faster", AutoSize = true, Anchor = AnchorStyles.Left }, 2, 0);
 
-        var presets = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, WrapContents = true };
+        var presets = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Dock = DockStyle.Fill, WrapContents = false };
         presets.Controls.Add(new Label { Text = "Presets:", AutoSize = true, Padding = new Padding(0, 6, 0, 0) });
         foreach (var p in new[] { 2, 5, 10, 20, 40, 60, 100, 200, 400 })
         {
             var b = MakeButton($"{p}×", (_, _) => SetSpeed(p), lockWhileRunning: true);
             b.AutoSize = false;
-            b.Width = 52;
+            b.MinimumSize = Size.Empty;
+            b.Width = 56;
             presets.Controls.Add(b);
         }
         layout.Controls.Add(presets, 0, 1);
@@ -243,8 +248,8 @@ public sealed class MainForm : Form
 
     private Control BuildQualityGroup()
     {
-        var group = new GroupBox { Text = "Quality", Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(8) };
-        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 4 };
+        var group = new GroupBox { Text = "Quality", Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(8) };
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 4 };
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
@@ -301,8 +306,8 @@ public sealed class MainForm : Form
 
     private Control BuildOutputGroup()
     {
-        var group = new GroupBox { Text = "Output file", Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(8) };
-        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 2 };
+        var group = new GroupBox { Text = "Output file", Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(8) };
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 2 };
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         _output.Dock = DockStyle.Fill;
@@ -362,7 +367,7 @@ public sealed class MainForm : Form
 
     private Button MakeButton(string text, EventHandler onClick, bool lockWhileRunning = false, string? name = null)
     {
-        var b = new Button { Text = text, AutoSize = true, MinimumSize = new Size(110, 0), Name = name ?? "" };
+        var b = new Button { Text = text, AutoSize = true, MinimumSize = new Size(110, 0), Margin = new Padding(3, 2, 3, 2), Name = name ?? "" };
         b.Click += onClick;
         if (lockWhileRunning) _lockWhileRunning.Add(b);
         return b;
@@ -590,7 +595,7 @@ public sealed class MainForm : Form
         if (_list.Columns.Count == 0) return;
         int used = 0;
         for (int i = 0; i < _list.Columns.Count - 1; i++) used += _list.Columns[i].Width;
-        int w = _list.ClientSize.Width - used - 2;
+        int w = _list.ClientSize.Width - used - 4;
         if (w > 80) _list.Columns[^1].Width = w;
     }
 
@@ -607,7 +612,7 @@ public sealed class MainForm : Form
             var unknown = _clips.Count(c => c.Duration == null);
             _clipSummary.Text = $"{_clips.Count} clip{(_clips.Count == 1 ? "" : "s")}, total {FormatDuration(TotalDuration())}" +
                                 (unknown > 0 ? $"  ({unknown} with unknown duration)" : "") +
-                                "    Tip: drag rows to reorder, Alt+↑/↓ to move, Del to remove.";
+                                "    Tip: drag rows to reorder, Alt+Up/Down to move, Del to remove.";
         }
         UpdateSpeedInfo();
     }

@@ -4,6 +4,8 @@ A small Windows 10/11 app that turns a batch of GoPro clips into one sped-up tim
 It's a single `GoProTimelapser.exe`: no installer and no admin rights, and it works offline
 because ffmpeg is built into the exe.
 
+![GoPro Timelapser](docs/screenshot.png)
+
 ## Using it
 
 1. **Clips**: drag `.MP4` files (or a whole folder) from Explorer into the list. Each row shows
