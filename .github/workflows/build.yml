@@ -16,9 +16,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: "8.0.x"
+      # windows-latest already ships the .NET 8 SDK
+      - name: .NET info
+        run: dotnet --list-sdks
 
       - name: Build
         shell: pwsh
