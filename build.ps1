@@ -7,8 +7,20 @@ $ffmpegDir = 'src\GoProTimelapser\ffmpeg'
 $ffmpegExe = Join-Path $ffmpegDir 'ffmpeg.exe'
 
 if (-not (Test-Path $ffmpegExe)) {
-    # Static GPL build: includes libx264 and Intel QuickSync (libvpl) support.
-    $url = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-win64-gpl-7.1.zip'
+    # Static GPL build from BtbN: includes libx264 and Intel QuickSync (libvpl) support.
+    # Asset names change with each ffmpeg release, so look them up rather than hard-coding one.
+    $headers = @{ 'User-Agent' = 'gopro-timelapser-build' }
+    if ($env:GITHUB_TOKEN) { $headers['Authorization'] = "Bearer $env:GITHUB_TOKEN" }
+    $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/tags/latest' -Headers $headers
+    $names = $release.assets | ForEach-Object { $_.name }
+    # Prefer the newest stable release branch (e.g. ffmpeg-n8.0-latest-win64-gpl-8.0.zip), else master.
+    $asset = $release.assets |
+        Where-Object { $_.name -match '^ffmpeg-n(\d+)\.(\d+)-latest-win64-gpl-[\d.]+\.zip$' } |
+        Sort-Object { [int]($_.name -replace '^ffmpeg-n(\d+)\.(\d+).*', '$1') }, { [int]($_.name -replace '^ffmpeg-n(\d+)\.(\d+).*', '$2') } |
+        Select-Object -Last 1
+    if (-not $asset) { $asset = $release.assets | Where-Object { $_.name -eq 'ffmpeg-master-latest-win64-gpl.zip' } | Select-Object -First 1 }
+    if (-not $asset) { throw "No win64-gpl ffmpeg build found. Assets: $($names -join ', ')" }
+    $url = $asset.browser_download_url
     $zip = Join-Path $env:TEMP 'ffmpeg-win64.zip'
     $tmp = Join-Path $env:TEMP 'ffmpeg-win64'
     Write-Host "Downloading ffmpeg from $url"
