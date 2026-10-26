@@ -43,59 +43,66 @@ enum TestClips {
         guard writer.startWriting() else { throw writer.error ?? NSError(domain: "TestClips", code: 1) }
         writer.startSession(atSourceTime: .zero)
 
+        // Each input pulls its own data on its own queue (the pattern that never stalls the writer).
         let frames = Int(seconds * Double(fps))
-        let samplesPerFrame = 48_000 / Int(fps)
-        for i in 0..<frames {
-            // Video frame: a moving grey level so frames differ.
-            waitReady(vIn)
-            var pb: CVPixelBuffer?
-            CVPixelBufferPoolCreatePixelBuffer(nil, adaptor.pixelBufferPool!, &pb)
-            if let pb = pb {
-                CVPixelBufferLockBaseAddress(pb, [])
-                let level = UInt8((i * 4) % 256)
-                memset(CVPixelBufferGetBaseAddress(pb), Int32(level), CVPixelBufferGetDataSize(pb))
-                CVPixelBufferUnlockBaseAddress(pb, [])
-                adaptor.append(pb, withPresentationTime: CMTime(value: CMTimeValue(i), timescale: fps))
-            }
-            // Matching slice of a sine tone.
-            if let aIn = aIn, let format = format {
-                waitReady(aIn)
-                let start = i * samplesPerFrame
-                var samples = [Int16](repeating: 0, count: samplesPerFrame * 2)
-                for n in 0..<samplesPerFrame {
-                    let v = Int16(8000 * sin(2 * .pi * tone * Double(start + n) / 48_000))
-                    samples[2 * n] = v
-                    samples[2 * n + 1] = v
+        let group = DispatchGroup()
+
+        group.enter()
+        var frame = 0
+        vIn.requestMediaDataWhenReady(on: DispatchQueue(label: "testclips.video")) {
+            while vIn.isReadyForMoreMediaData {
+                if frame >= frames { vIn.markAsFinished(); group.leave(); return }
+                var pb: CVPixelBuffer?
+                CVPixelBufferPoolCreatePixelBuffer(nil, adaptor.pixelBufferPool!, &pb)
+                if let pb = pb {
+                    // A moving grey level so frames differ.
+                    CVPixelBufferLockBaseAddress(pb, [])
+                    memset(CVPixelBufferGetBaseAddress(pb), Int32((frame * 4) % 256), CVPixelBufferGetDataSize(pb))
+                    CVPixelBufferUnlockBaseAddress(pb, [])
+                    adaptor.append(pb, withPresentationTime: CMTime(value: CMTimeValue(frame), timescale: fps))
                 }
-                let bytes = samples.count * 2
-                var block: CMBlockBuffer?
-                CMBlockBufferCreateWithMemoryBlock(allocator: nil, memoryBlock: nil, blockLength: bytes, blockAllocator: nil,
-                                                   customBlockSource: nil, offsetToData: 0, dataLength: bytes, flags: 0,
-                                                   blockBufferOut: &block)
-                samples.withUnsafeBytes { raw in
-                    _ = CMBlockBufferReplaceDataBytes(with: raw.baseAddress!, blockBuffer: block!, offsetIntoDestination: 0, dataLength: bytes)
-                }
-                var sb: CMSampleBuffer?
-                CMAudioSampleBufferCreateReadyWithPacketDescriptions(allocator: nil, dataBuffer: block!, formatDescription: format,
-                                                                     sampleCount: samplesPerFrame,
-                                                                     presentationTimeStamp: CMTime(value: CMTimeValue(start), timescale: 48_000),
-                                                                     packetDescriptions: nil, sampleBufferOut: &sb)
-                if let sb = sb { aIn.append(sb) }
+                frame += 1
             }
         }
-        vIn.markAsFinished()
-        aIn?.markAsFinished()
+
+        if let aIn = aIn, let format = format {
+            group.enter()
+            let chunk = 4800
+            let totalSamples = Int(seconds * 48_000)
+            var start = 0
+            aIn.requestMediaDataWhenReady(on: DispatchQueue(label: "testclips.audio")) {
+                while aIn.isReadyForMoreMediaData {
+                    if start >= totalSamples { aIn.markAsFinished(); group.leave(); return }
+                    let count = min(chunk, totalSamples - start)
+                    var samples = [Int16](repeating: 0, count: count * 2)
+                    for n in 0..<count {
+                        let v = Int16(8000 * sin(2 * .pi * tone * Double(start + n) / 48_000))
+                        samples[2 * n] = v
+                        samples[2 * n + 1] = v
+                    }
+                    let bytes = samples.count * 2
+                    var block: CMBlockBuffer?
+                    CMBlockBufferCreateWithMemoryBlock(allocator: nil, memoryBlock: nil, blockLength: bytes, blockAllocator: nil,
+                                                       customBlockSource: nil, offsetToData: 0, dataLength: bytes, flags: 0,
+                                                       blockBufferOut: &block)
+                    samples.withUnsafeBytes { raw in
+                        _ = CMBlockBufferReplaceDataBytes(with: raw.baseAddress!, blockBuffer: block!, offsetIntoDestination: 0, dataLength: bytes)
+                    }
+                    var sb: CMSampleBuffer?
+                    CMAudioSampleBufferCreateReadyWithPacketDescriptions(allocator: nil, dataBuffer: block!, formatDescription: format,
+                                                                         sampleCount: count,
+                                                                         presentationTimeStamp: CMTime(value: CMTimeValue(start), timescale: 48_000),
+                                                                         packetDescriptions: nil, sampleBufferOut: &sb)
+                    if let sb = sb { aIn.append(sb) }
+                    start += count
+                }
+            }
+        }
+
+        group.wait()
         let done = DispatchSemaphore(value: 0)
         writer.finishWriting { done.signal() }
         done.wait()
         if writer.status != .completed { throw writer.error ?? NSError(domain: "TestClips", code: 2) }
-    }
-
-    private static func waitReady(_ input: AVAssetWriterInput) {
-        var tries = 0
-        while !input.isReadyForMoreMediaData && tries < 5000 {
-            usleep(1000)
-            tries += 1
-        }
     }
 }
