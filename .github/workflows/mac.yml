@@ -59,17 +59,52 @@ jobs:
         timeout-minutes: 5
         run: |
           mkdir -p build/shots build/clips
-          GPT_SCREENSHOT_DIR="$PWD/build/clips" swift test --filter testWriteScreenshotClips
+          GPT_SCREENSHOT_DIR="$PWD/build/clips" swift test --filter testWriteScreenshotClips > /dev/null
+
+          # Debug build first: on a crash Swift prints the exact error and source line.
+          swift build 2>&1 | tail -1
+          echo "::group::Debug launch"
+          (.build/debug/GoProTimelapser "$PWD/build/clips" > build/debug-app.log 2>&1 &) ; sleep 8
+          pkill -f .build/debug/GoProTimelapser || true
+          cat build/debug-app.log
+          echo "::endgroup::"
+
           BIN="build/GoPro Timelapser.app/Contents/MacOS/GoProTimelapser"
           for tab in timelapse join; do
-            GPT_TAB=$tab "$BIN" "$PWD/build/clips" &
+            GPT_TAB=$tab "$BIN" "$PWD/build/clips" > "build/app-$tab.log" 2>&1 &
             PID=$!
             sleep 8
             screencapture -x "build/shots/$tab.png"
-            kill $PID || true
+            if kill -0 $PID 2>/dev/null; then echo "$tab: app still running (good)"; kill $PID; else echo "$tab: APP EXITED/CRASHED"; fi
+            cat "build/app-$tab.log"
             sleep 1
           done
-          ls -la build/shots
+
+          # Crash report backtrace, if any.
+          REPORT="$(ls -t ~/Library/Logs/DiagnosticReports/GoProTimelapser* 2>/dev/null | head -1 || true)"
+          if [ -n "$REPORT" ]; then
+            echo "::group::Crash report $REPORT"
+            python3 - "$REPORT" <<'PY'
+          import json, sys
+          text = open(sys.argv[1]).read()
+          header, _, body = text.partition("\n")
+          r = json.loads(body)
+          print("exception:", r.get("exception"), r.get("termination", {}).get("indicator"))
+          t = r["threads"][r["faultingThread"]]
+          imgs = r.get("usedImages", [])
+          for f in t["frames"][:25]:
+              img = imgs[f["imageIndex"]].get("name", "?") if f.get("imageIndex") is not None else "?"
+              print(f"  {img:28} {f.get('symbol', '?')}  +{f.get('symbolLocation', f.get('imageOffset'))}  {f.get('sourceFile', '')}:{f.get('sourceLine', '')}")
+          PY
+            echo "::endgroup::"
+          fi
+
+          # Small JPEG copies of the screenshots, base64 in the log so they can be viewed without downloading.
+          for tab in timelapse join; do
+            [ -f "build/shots/$tab.png" ] || continue
+            sips -Z 1200 -s format jpeg -s formatOptions 70 "build/shots/$tab.png" --out "build/shots/$tab-small.jpg" > /dev/null
+            echo "BEGIN-SHOT $tab"; base64 -b 120 -i "build/shots/$tab-small.jpg"; echo "END-SHOT $tab"
+          done
 
       - uses: actions/upload-artifact@v4
         with:
