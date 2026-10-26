@@ -12,6 +12,11 @@ on:
 permissions:
   contents: write
 
+# A new push cancels the previous run on the same branch.
+concurrency:
+  group: mac-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: macos-15
@@ -28,9 +33,11 @@ jobs:
           swift --version
 
       - name: Test (Apple Silicon)
+        timeout-minutes: 6
         run: swift test
 
       - name: Test (Intel, under Rosetta)
+        timeout-minutes: 8
         run: swift test --arch x86_64
 
       - name: Build universal app
@@ -41,6 +48,7 @@ jobs:
 
       - name: Screenshots
         continue-on-error: true
+        timeout-minutes: 5
         run: |
           mkdir -p build/shots build/clips
           GPT_SCREENSHOT_DIR="$PWD/build/clips" swift test --filter testWriteScreenshotClips

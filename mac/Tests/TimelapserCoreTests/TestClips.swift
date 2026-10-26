@@ -99,7 +99,10 @@ enum TestClips {
             }
         }
 
-        group.wait()
+        // A failed writer stops asking for data, so don't wait on the group forever.
+        while group.wait(timeout: .now() + 0.5) == .timedOut {
+            if writer.status == .failed { throw writer.error ?? NSError(domain: "TestClips", code: 3) }
+        }
         let done = DispatchSemaphore(value: 0)
         writer.finishWriting { done.signal() }
         done.wait()

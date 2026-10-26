@@ -194,9 +194,12 @@ public final class Transcoder {
         if let audioOut = audioOut, let audioIn = audioIn {
             pump(audioOut, into: audioIn, label: "audio", group: group, progress: nil)
         }
-        group.wait()
+        waitForPumps(group, writer: writer, readers: [videoReader] + (audioReader.map { [$0] } ?? []))
 
         if isCancelled { writer.cancelWriting(); throw JobCancelled() }
+        if writer.status == .failed {
+            throw MediaError("Writing the video failed: \(writer.error?.localizedDescription ?? "unknown error")")
+        }
         if videoReader.status == .failed {
             writer.cancelWriting()
             throw MediaError("Reading the clips failed: \(videoReader.error?.localizedDescription ?? "unknown error")")
@@ -262,7 +265,7 @@ public final class Transcoder {
         writer.startSession(atSourceTime: .zero)
         let group = DispatchGroup()
         pump(out, into: input, label: "audio-prepass", group: group, progress: nil)
-        group.wait()
+        waitForPumps(group, writer: writer, readers: [reader])
         if isCancelled { throw JobCancelled() }
         let done = DispatchSemaphore(value: 0)
         writer.finishWriting { done.signal() }
@@ -303,6 +306,17 @@ public final class Transcoder {
                 guard let buffer = output.copyNextSampleBuffer() else { finish(); return }
                 if !input.append(buffer) { finish(); return }
                 progress?(CMSampleBufferGetPresentationTimeStamp(buffer))
+            }
+        }
+    }
+
+    /// Waits for the pumps to finish. If the writer fails or is cancelled it stops asking for data,
+    /// so the pumps would never finish on their own: stop the readers and return instead.
+    private func waitForPumps(_ group: DispatchGroup, writer: AVAssetWriter, readers: [AVAssetReader]) {
+        while group.wait(timeout: .now() + 0.5) == .timedOut {
+            if writer.status == .failed || writer.status == .cancelled || isCancelled {
+                readers.forEach { $0.cancelReading() }
+                return
             }
         }
     }
