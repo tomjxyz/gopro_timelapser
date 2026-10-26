@@ -4,6 +4,8 @@ A native Mac app (Swift + AppKit) that uses macOS's own video engine (AVFoundati
 so there is no ffmpeg to bundle. It's a **universal app**: it runs natively on Apple Silicon and on Intel
 Macs back to **macOS 10.15 Catalina**.
 
+**New to the app?** Read the [user guide (PDF)](docs/GoPro-Timelapser-User-Guide.pdf).
+
 ## Tabs
 
 **Timelapse**
