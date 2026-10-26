@@ -1,3 +1,5 @@
+> **Looking for the Mac version?** See [`mac/`](mac/README.md). The Windows app below is no longer maintained.
+
 # GoPro Timelapser
 
 A small Windows 10/11 app that turns a batch of GoPro clips into one sped-up timelapse.
