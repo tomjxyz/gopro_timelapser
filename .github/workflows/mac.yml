@@ -41,8 +41,11 @@ jobs:
 
       - name: Test (Intel, under Rosetta)
         timeout-minutes: 8
+        # Build the Intel test bundle, then run Xcode's (universal) test runner under Rosetta.
         run: |
-          script -q /dev/null bash -c 'swift test --arch x86_64; echo $? > "$RUNNER_TEMP/rc"'
+          swift build --build-tests --arch x86_64
+          BUNDLE="$(swift build --build-tests --arch x86_64 --show-bin-path)/GoProTimelapserPackageTests.xctest"
+          script -q /dev/null bash -c "arch -x86_64 xcrun xctest '$BUNDLE'; echo \$? > '$RUNNER_TEMP/rc'"
           exit "$(cat "$RUNNER_TEMP/rc")"
 
       - name: Build universal app
