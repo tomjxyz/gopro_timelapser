@@ -34,11 +34,16 @@ jobs:
 
       - name: Test (Apple Silicon)
         timeout-minutes: 6
-        run: swift test
+        # Run under a pseudo-terminal so test output streams live instead of arriving at the end.
+        run: |
+          script -q /dev/null bash -c 'swift test; echo $? > "$RUNNER_TEMP/rc"'
+          exit "$(cat "$RUNNER_TEMP/rc")"
 
       - name: Test (Intel, under Rosetta)
         timeout-minutes: 8
-        run: swift test --arch x86_64
+        run: |
+          script -q /dev/null bash -c 'swift test --arch x86_64; echo $? > "$RUNNER_TEMP/rc"'
+          exit "$(cat "$RUNNER_TEMP/rc")"
 
       - name: Build universal app
         run: |

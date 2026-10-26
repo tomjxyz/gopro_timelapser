@@ -2,6 +2,11 @@ import AVFoundation
 import XCTest
 @testable import TimelapserCore
 
+/// Prints straight to stderr (unbuffered) so CI shows progress even if a test hangs.
+func trace(_ text: String) {
+    FileHandle.standardError.write("[\(Date())] \(text)\n".data(using: .utf8)!)
+}
+
 final class TimelapserCoreTests: XCTestCase {
     static var dir: URL!
     static var clips: [URL] = []   // 3 × 20 s, 320×240, with a tone
@@ -12,7 +17,9 @@ final class TimelapserCoreTests: XCTestCase {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         clips = ["GX010042.MP4", "GX020042.MP4", "GX030042.MP4"].enumerated().map { i, name in
             let url = dir.appendingPathComponent(name)
+            trace("making test clip \(name)")
             try! TestClips.make(url, seconds: 20, tone: 300 + Double(i) * 200)
+            trace("made test clip \(name)")
             return url
         }
     }
@@ -23,6 +30,38 @@ final class TimelapserCoreTests: XCTestCase {
     }
 
     private func out(_ name: String) -> URL { Self.dir.appendingPathComponent(name) }
+
+    override func setUp() {
+        super.setUp()
+        trace("start \(name)")
+    }
+
+    override func tearDown() {
+        trace("end \(name)")
+        super.tearDown()
+    }
+
+    /// Runs a job with a time limit; on timeout it is cancelled and the test fails with its log.
+    private func runJob(_ job: MediaJob, timeout: TimeInterval = 60) throws {
+        var lines: [String] = []
+        let lock = NSLock()
+        job.onLog = { line in lock.lock(); lines.append(line); lock.unlock(); trace("  log: \(line)") }
+        var lastStatus = ""
+        job.onProgress = { _, status in lock.lock(); lastStatus = status; lock.unlock() }
+        var failure: Error?
+        let done = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            do { try job.run() } catch { failure = error }
+            done.signal()
+        }
+        if done.wait(timeout: .now() + timeout) == .timedOut {
+            job.cancel()
+            let cancelled = done.wait(timeout: .now() + 10) == .success
+            lock.lock(); defer { lock.unlock() }
+            throw MediaError("Timed out after \(Int(timeout)) s (cancel \(cancelled ? "worked" : "also hung")). Last status: \(lastStatus). Log: \(lines.joined(separator: " | "))")
+        }
+        if let failure = failure { throw failure }
+    }
 
     private func videoInfo(_ url: URL) -> (duration: Double, size: CGSize, fps: Float, hasAudio: Bool, audioDuration: Double) {
         let asset = AVURLAsset(url: url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
@@ -88,7 +127,7 @@ final class TimelapserCoreTests: XCTestCase {
         s.fps = 30
         s.audio = audio
         let url = out(name)
-        try Transcoder(urls: Self.clips, output: url, settings: s).run()
+        try runJob(Transcoder(urls: Self.clips, output: url, settings: s))
         return url
     }
 
@@ -133,7 +172,7 @@ final class TimelapserCoreTests: XCTestCase {
         s.speed = 20
         s.maxHeight = 2160
         let url = out("noupscale.mp4")
-        try Transcoder(urls: Self.clips, output: url, settings: s).run()
+        try runJob(Transcoder(urls: Self.clips, output: url, settings: s))
         XCTAssertEqual(videoInfo(url).size, CGSize(width: 320, height: 240))
     }
 
@@ -142,7 +181,7 @@ final class TimelapserCoreTests: XCTestCase {
     func testLosslessJoinWithTrimAndDate() throws {
         let date = Date(timeIntervalSince1970: 1_790_000_000) // 2026-09
         let url = out("joined.mp4")
-        try LosslessJoiner(urls: Self.clips, output: url, includeAudio: true, trimStart: 1, trimEnd: 2, recordingDate: date).run()
+        try runJob(LosslessJoiner(urls: Self.clips, output: url, includeAudio: true, trimStart: 1, trimEnd: 2, recordingDate: date))
         let info = videoInfo(url)
         XCTAssertEqual(info.duration, 57, accuracy: 0.3)
         XCTAssertEqual(info.size, CGSize(width: 320, height: 240))
@@ -158,7 +197,7 @@ final class TimelapserCoreTests: XCTestCase {
 
     func testLosslessJoinWithoutSound() throws {
         let url = out("joined-silent.mp4")
-        try LosslessJoiner(urls: Self.clips, output: url, includeAudio: false, trimStart: 0, trimEnd: 0, recordingDate: nil).run()
+        try runJob(LosslessJoiner(urls: Self.clips, output: url, includeAudio: false, trimStart: 0, trimEnd: 0, recordingDate: nil))
         let info = videoInfo(url)
         XCTAssertEqual(info.duration, 60, accuracy: 0.3)
         XCTAssertFalse(info.hasAudio)
@@ -172,7 +211,7 @@ final class TimelapserCoreTests: XCTestCase {
         s.audio = .keepPitch
         s.trimEnd = 10
         let url = out("joined-small.mp4")
-        try Transcoder(urls: Self.clips, output: url, settings: s).run()
+        try runJob(Transcoder(urls: Self.clips, output: url, settings: s))
         let info = videoInfo(url)
         XCTAssertEqual(info.duration, 50, accuracy: 0.4)
         XCTAssertEqual(info.size, CGSize(width: 160, height: 120))
