@@ -60,9 +60,6 @@ public final class Transcoder {
     private let settings: EncodeSettings
     private let lock = NSLock()
     private var cancelled = false
-    private var activeReaders: [AVAssetReader] = []
-    private var activeWriter: AVAssetWriter?
-    private var tempFiles: [URL] = []
 
     public init(urls: [URL], output: URL, settings: EncodeSettings) {
         self.urls = urls
@@ -70,14 +67,12 @@ public final class Transcoder {
         self.settings = settings
     }
 
+    /// Asks the job to stop. The encode loops notice between frames; the writer is then
+    /// cancelled from the job's own thread, never while a frame is being appended.
     public func cancel() {
         lock.lock()
         cancelled = true
-        let readers = activeReaders
-        let writer = activeWriter
         lock.unlock()
-        readers.forEach { $0.cancelReading() }
-        writer?.cancelWriting()
     }
 
     private var isCancelled: Bool {
@@ -87,7 +82,6 @@ public final class Transcoder {
 
     /// Runs synchronously; call from a background queue.
     public func run() throws {
-        defer { tempFiles.forEach { try? FileManager.default.removeItem(at: $0) } }
         do {
             try runInner()
         } catch {
@@ -117,11 +111,22 @@ public final class Transcoder {
         let bitrate = s.bitrate(width: Int(size.width), height: Int(size.height))
         log("Output \(Int(size.width))×\(Int(size.height)) @ \(s.fps) fps, \(s.codec == .hevc ? "HEVC" : "H.264") ~\(bitrate / 1000) kbit/s, length \(Format.duration(outDuration.seconds))")
 
-        // ---- sound
-        var audioSource: (asset: AVAsset, algorithm: AVAudioTimePitchAlgorithm?)? = nil
+        // ---- sound: read unscaled, speed up in AudioSpeedProcessor (any factor, one pass)
+        var audioReader: AVAssetReader? = nil
+        var audioOut: AVAssetReaderAudioMixOutput? = nil
         if s.audio != .none {
-            audioSource = try prepareAudio()
-            if audioSource == nil { log("The clips have no sound; the output will be silent.") }
+            let audio = try JoinedComposition.build(urls, video: false, audio: true)
+            if audio.audioTrack != nil {
+                try audio.trim(start: s.trimStart, end: s.trimEnd)
+                let reader = try AVAssetReader(asset: audio.composition)
+                let out = AVAssetReaderAudioMixOutput(audioTracks: audio.composition.tracks(withMediaType: .audio),
+                                                      audioSettings: PCM.readerSettings)
+                reader.add(out)
+                audioReader = reader
+                audioOut = out
+            } else {
+                log("The clips have no sound; the output will be silent.")
+            }
         }
         if isCancelled { throw JobCancelled() }
 
@@ -147,13 +152,13 @@ public final class Transcoder {
         writer.add(videoIn)
 
         var audioIn: AVAssetWriterInput? = nil
-        if audioSource != nil {
+        if audioReader != nil {
             let input = AVAssetWriterInput(mediaType: .audio, outputSettings: Self.aacSettings)
             input.expectsMediaDataInRealTime = false
-            if writer.canAdd(input) { writer.add(input); audioIn = input }
+            if writer.canAdd(input) { writer.add(input); audioIn = input } else { audioReader = nil; audioOut = nil }
         }
 
-        // ---- readers
+        // ---- video reader: the composition renders only the frames needed at the output frame rate
         let videoReader = try AVAssetReader(asset: video.composition)
         let videoOut = AVAssetReaderVideoCompositionOutput(videoTracks: [vTrack], videoSettings: [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
@@ -163,22 +168,7 @@ public final class Transcoder {
         videoOut.alwaysCopiesSampleData = false
         videoReader.add(videoOut)
 
-        var audioReader: AVAssetReader? = nil
-        var audioOut: AVAssetReaderAudioMixOutput? = nil
-        if let src = audioSource, audioIn != nil {
-            let reader = try AVAssetReader(asset: src.asset)
-            let out = AVAssetReaderAudioMixOutput(audioTracks: src.asset.tracks(withMediaType: .audio), audioSettings: Self.pcmSettings)
-            if let alg = src.algorithm { out.audioTimePitchAlgorithm = alg }
-            reader.add(out)
-            audioReader = reader
-            audioOut = out
-        }
-
-        lock.lock()
-        activeWriter = writer
-        activeReaders = [videoReader] + (audioReader.map { [$0] } ?? [])
-        lock.unlock()
-
+        let readers = [videoReader] + (audioReader.map { [$0] } ?? [])
         guard writer.startWriting() else { throw MediaError("Couldn't start writing: \(writer.error?.localizedDescription ?? "unknown error")") }
         writer.startSession(atSourceTime: .zero)
         guard videoReader.startReading() else { throw MediaError("Couldn't read the clips: \(videoReader.error?.localizedDescription ?? "unknown error")") }
@@ -187,14 +177,20 @@ public final class Transcoder {
         let group = DispatchGroup()
         let total = outDuration.seconds
         let start = Date()
-        pump(videoOut, into: videoIn, label: "video", group: group) { [weak self] pts in
+        pump(into: videoIn, writer: writer, label: "video", group: group, next: { videoOut.copyNextSampleBuffer() }) { [weak self] pts in
             let p = min(1, max(0, pts.seconds / total))
             self?.onProgress?(p, Self.statusText(p, since: start))
         }
         if let audioOut = audioOut, let audioIn = audioIn {
-            pump(audioOut, into: audioIn, label: "audio", group: group, progress: nil)
+            if s.speed == 1 {
+                pump(into: audioIn, writer: writer, label: "audio", group: group, next: { audioOut.copyNextSampleBuffer() }, progress: nil)
+            } else {
+                let source = SpedUpAudioSource(output: audioOut,
+                                               processor: AudioSpeedProcessor(speed: s.speed, keepPitch: s.audio == .keepPitch))
+                pump(into: audioIn, writer: writer, label: "audio", group: group, next: { source.next() }, progress: nil)
+            }
         }
-        waitForPumps(group, writer: writer, readers: [videoReader] + (audioReader.map { [$0] } ?? []))
+        waitForPumps(group, writer: writer, readers: readers)
 
         if isCancelled { writer.cancelWriting(); throw JobCancelled() }
         if writer.status == .failed {
@@ -218,63 +214,6 @@ public final class Transcoder {
         onProgress?(1, "Finished in \(Format.duration(Date().timeIntervalSince(start)))")
     }
 
-    /// Builds the sped-up sound source. Apple's time-stretch handles up to 32× per pass, so higher
-    /// speeds go through a temporary file at √speed and are then sped up by √speed again.
-    private func prepareAudio() throws -> (asset: AVAsset, algorithm: AVAudioTimePitchAlgorithm?)? {
-        let s = settings
-        let audio = try JoinedComposition.build(urls, video: false, audio: true)
-        guard audio.audioTrack != nil else { return nil }
-        try audio.trim(start: s.trimStart, end: s.trimEnd)
-        if s.speed == 1 { return (audio.composition, nil) }
-
-        let algorithm: AVAudioTimePitchAlgorithm = s.audio == .chipmunk ? .varispeed : .spectral
-        let maxPerPass = 32.0
-        if s.speed <= maxPerPass {
-            audio.speedUp(s.speed)
-            return (audio.composition, algorithm)
-        }
-
-        let step = s.speed.squareRoot()
-        audio.speedUp(step)
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent("gpt-audio-\(UUID().uuidString).caf")
-        tempFiles.append(temp)
-        log("Preparing sound (\(Int(s.speed))× in two passes of \(String(format: "%.1f", step))×)…")
-        onProgress?(0, "Preparing sound…")
-        try renderAudio(audio.composition, algorithm: algorithm, to: temp)
-
-        let second = try JoinedComposition.build([temp], video: false, audio: true)
-        second.speedUp(step)
-        return (second.composition, algorithm)
-    }
-
-    /// Writes an asset's (scaled) sound to an uncompressed CAF file.
-    private func renderAudio(_ asset: AVAsset, algorithm: AVAudioTimePitchAlgorithm, to url: URL) throws {
-        let reader = try AVAssetReader(asset: asset)
-        let out = AVAssetReaderAudioMixOutput(audioTracks: asset.tracks(withMediaType: .audio), audioSettings: Self.pcmSettings)
-        out.audioTimePitchAlgorithm = algorithm
-        reader.add(out)
-        let writer = try AVAssetWriter(outputURL: url, fileType: .caf)
-        let input = AVAssetWriterInput(mediaType: .audio, outputSettings: Self.pcmSettings)
-        input.expectsMediaDataInRealTime = false
-        writer.add(input)
-
-        lock.lock(); activeReaders = [reader]; activeWriter = writer; lock.unlock()
-        guard writer.startWriting(), reader.startReading() else {
-            throw MediaError("Couldn't process the sound: \((reader.error ?? writer.error)?.localizedDescription ?? "unknown error")")
-        }
-        writer.startSession(atSourceTime: .zero)
-        let group = DispatchGroup()
-        pump(out, into: input, label: "audio-prepass", group: group, progress: nil)
-        waitForPumps(group, writer: writer, readers: [reader])
-        if isCancelled { throw JobCancelled() }
-        let done = DispatchSemaphore(value: 0)
-        writer.finishWriting { done.signal() }
-        done.wait()
-        if reader.status == .failed || writer.status != .completed {
-            throw MediaError("Processing the sound failed: \((reader.error ?? writer.error)?.localizedDescription ?? "unknown error")")
-        }
-    }
-
     private func makeVideoComposition(_ video: JoinedComposition, renderSize: CGSize) -> AVVideoComposition {
         let scale = renderSize.height / max(1, video.displaySize.height)
         let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: video.videoTrack!)
@@ -289,8 +228,8 @@ public final class Transcoder {
         return vc
     }
 
-    private func pump(_ output: AVAssetReaderOutput, into input: AVAssetWriterInput, label: String,
-                      group: DispatchGroup, progress: ((CMTime) -> Void)?) {
+    private func pump(into input: AVAssetWriterInput, writer: AVAssetWriter, label: String, group: DispatchGroup,
+                      next: @escaping () -> CMSampleBuffer?, progress: ((CMTime) -> Void)?) {
         group.enter()
         let queue = DispatchQueue(label: "gpt.pump.\(label)")
         var finished = false
@@ -298,25 +237,27 @@ public final class Transcoder {
             guard !finished else { return }
             func finish() {
                 finished = true
-                input.markAsFinished()
+                // Only a writer that is still writing accepts markAsFinished.
+                if writer.status == .writing { input.markAsFinished() }
                 group.leave()
             }
             while input.isReadyForMoreMediaData {
-                if self?.isCancelled ?? true { finish(); return }
-                guard let buffer = output.copyNextSampleBuffer() else { finish(); return }
+                if self?.isCancelled ?? true || writer.status != .writing { finish(); return }
+                guard let buffer = next() else { finish(); return }
                 if !input.append(buffer) { finish(); return }
                 progress?(CMSampleBufferGetPresentationTimeStamp(buffer))
             }
         }
     }
 
-    /// Waits for the pumps to finish. If the writer fails or is cancelled it stops asking for data,
-    /// so the pumps would never finish on their own: stop the readers and return instead.
+    /// Waits for the pumps to finish. A failed writer stops asking for data, so its pumps would
+    /// never finish on their own; after cancelling, the pumps get a moment to wind down.
     private func waitForPumps(_ group: DispatchGroup, writer: AVAssetWriter, readers: [AVAssetReader]) {
-        while group.wait(timeout: .now() + 0.5) == .timedOut {
-            if writer.status == .failed || writer.status == .cancelled || isCancelled {
-                readers.forEach { $0.cancelReading() }
-                return
+        var stopSince: Date?
+        while group.wait(timeout: .now() + 0.25) == .timedOut {
+            if writer.status == .failed || isCancelled {
+                if stopSince == nil { stopSince = Date() }
+                if Date().timeIntervalSince(stopSince!) > 3 { return }
             }
         }
     }
@@ -329,16 +270,6 @@ public final class Transcoder {
         if p > 0.02 { text += "   remaining ≈ " + Format.duration(elapsed * (1 - p) / p) }
         return text
     }
-
-    static let pcmSettings: [String: Any] = [
-        AVFormatIDKey: kAudioFormatLinearPCM,
-        AVSampleRateKey: 48_000,
-        AVNumberOfChannelsKey: 2,
-        AVLinearPCMBitDepthKey: 16,
-        AVLinearPCMIsFloatKey: false,
-        AVLinearPCMIsBigEndianKey: false,
-        AVLinearPCMIsNonInterleaved: false,
-    ]
 
     static let aacSettings: [String: Any] = [
         AVFormatIDKey: kAudioFormatMPEG4AAC,

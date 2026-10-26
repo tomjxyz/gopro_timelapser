@@ -118,6 +118,78 @@ final class TimelapserCoreTests: XCTestCase {
         XCTAssertNotNil(clip.recorded)
     }
 
+    // MARK: - Sound speed-up
+
+    /// 10 s of a stereo sine tone at 48 kHz, interleaved.
+    private func tone(_ hz: Double, seconds: Double = 10) -> [Int16] {
+        let n = Int(seconds * 48_000)
+        var out = [Int16](repeating: 0, count: n * 2)
+        for i in 0..<n {
+            let v = Int16(10_000 * sin(2 * .pi * hz * Double(i) / 48_000))
+            out[2 * i] = v
+            out[2 * i + 1] = v
+        }
+        return out
+    }
+
+    /// Estimated frequency of the left channel from zero crossings.
+    private func frequency(_ samples: [Int16]) -> Double {
+        let left = stride(from: 0, to: samples.count, by: 2).map { samples[$0] }
+        var crossings = 0
+        for i in 1..<left.count where (left[i - 1] < 0) != (left[i] < 0) { crossings += 1 }
+        return Double(crossings) / 2 / (Double(left.count) / 48_000)
+    }
+
+    private func speedUp(_ input: [Int16], speed: Double, keepPitch: Bool) -> [Int16] {
+        let p = AudioSpeedProcessor(speed: speed, keepPitch: keepPitch)
+        var out: [Int16] = []
+        // Feed in uneven chunks like a real reader would.
+        var i = 0
+        let chunks = [2048, 9600, 1024, 4800]
+        var k = 0
+        while i < input.count {
+            let n = min(chunks[k % chunks.count] * 2, input.count - i)
+            out += p.process(Array(input[i..<(i + n)]))
+            i += n
+            k += 1
+        }
+        return out + p.finish()
+    }
+
+    func testAudioSpeedLengths() {
+        let input = tone(440)
+        for speed in [2.0, 10, 37, 100, 400] {
+            for keep in [true, false] {
+                let out = speedUp(input, speed: speed, keepPitch: keep)
+                let expected = Double(input.count) / speed
+                XCTAssertEqual(Double(out.count), expected, accuracy: max(expected * 0.05, 4096 * 2 + 2),
+                               "speed \(speed) keepPitch \(keep)")
+            }
+        }
+    }
+
+    func testKeepPitchKeepsPitchAndChipmunkRaisesIt() {
+        let input = tone(220, seconds: 20)
+        let kept = speedUp(input, speed: 4, keepPitch: true)
+        XCTAssertEqual(frequency(kept), 220, accuracy: 15)
+        let chip = speedUp(input, speed: 4, keepPitch: false)
+        XCTAssertEqual(frequency(chip), 880, accuracy: 40)
+    }
+
+    func testCancelStopsCleanly() throws {
+        var s = EncodeSettings()
+        s.speed = 2
+        s.maxHeight = nil
+        s.audio = .keepPitch
+        let url = out("cancelled.mp4")
+        let job = Transcoder(urls: Self.clips, output: url, settings: s)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.3) { job.cancel() }
+        XCTAssertThrowsError(try runJob(job, timeout: 30)) { error in
+            XCTAssertTrue(error is JobCancelled, "got \(error)")
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
     // MARK: - Timelapse
 
     private func timelapse(speed: Double, audio: AudioMode, name: String) throws -> URL {
