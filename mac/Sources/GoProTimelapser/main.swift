@@ -6,6 +6,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let tabView = NSTabView()
     private let timelapse = TimelapseTab()
     private let join = JoinTab()
+    private var launched = false
+    private var pendingFiles: [URL] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildMenu()
@@ -40,16 +42,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             join.clips.add(urls)
         }
         if ProcessInfo.processInfo.environment["GPT_TAB"] == "join" { tabView.selectTabViewItem(at: 1) }
+        launched = true
+        if !pendingFiles.isEmpty { addToVisibleTab(pendingFiles) }
+        pendingFiles = []
 
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    /// Files dropped on the Dock icon go into the visible tab.
+    /// Files dropped on the Dock icon go into the visible tab. macOS can deliver these before
+    /// applicationDidFinishLaunching (e.g. when the drop also launches the app), so hold them until then.
     func application(_ sender: NSApplication, openFiles filenames: [String]) {
         let urls = filenames.map { URL(fileURLWithPath: $0) }
-        if tabView.indexOfTabViewItem(tabView.selectedTabViewItem!) == 1 { join.clips.add(urls) } else { timelapse.clips.add(urls) }
+        if launched {
+            addToVisibleTab(urls)
+        } else {
+            pendingFiles += urls
+        }
         sender.reply(toOpenOrPrint: .success)
+    }
+
+    private func addToVisibleTab(_ urls: [URL]) {
+        let joinVisible = tabView.selectedTabViewItem.map { tabView.indexOfTabViewItem($0) == 1 } ?? false
+        if joinVisible { join.clips.add(urls) } else { timelapse.clips.add(urls) }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
